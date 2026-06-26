@@ -14,11 +14,27 @@ Data generated for the DYnamics of the Atmospheric general circulation Modeled O
 
 ### CESM DYAMOND Simulations
 
-We use data from the km-scale CESM run for DYnamics of the Atmospheric general circulation Modeled On Non-hydrostatic Domains (DYAMOND).
+We use data from the km-scale CESM run for DYnamics of the Atmospheric general circulation Modeled On Non-hydrostatic Domains (DYAMOND). The atmospheric model used in this simulation is the Community Atmosphere Model (CAM7), which runs at a resolution of 3.75 km on 58 atmospheric levels with modified CAM physics (no ZM convection scheme, modified CLUBB). This includes 2(3??) runs: DYAMOND1 is a 40-day run starting on 1 August 2016, DYAMOND2 is a 40-day run starting on 20 January 2020, and DYAMOND3 (not used here) is a 1-year run starting on 1 March 2020. These are initialized with ERA5 and coupled to high-resolution (3.75 km) land, ocean, and sea ice.
 
-58 vertical levels
+Tendencies are calculated for each 3-hour interval. 
 
-following the approach of Yugal & O'Gorman (2020)
+### Coarse Graining
+
+Data are coarse-grained to 1˚ resolution by taking the weighted average by area. 
+???
+
+### Data
+
+???
+
+### Machine Learning Architecture
+
+???
+
+## Results
+
+
+???
 
 ## References
 
