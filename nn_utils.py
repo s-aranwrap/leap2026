@@ -955,3 +955,187 @@ def train_unet(
             print(f"saved to {save_path}")
 
     return model, scaler, history
+
+
+
+
+
+
+
+
+
+
+
+class ProfileTransformer(nn.Module):
+    def __init__(
+        self,
+        n_conv_vars=4, n1=58, n_scalar=0, n_outputs=58,
+        d_model=64,              # token embedding width
+        nhead=4,                 # attention heads
+        num_layers=3,            # transformer encoder layers
+        dim_feedforward=128,     # width of each layer's internal MLP
+        conv_channels=(32,),     # conv front-end that builds tokens from the profile
+        kernel_size=3,
+        dropout=0.1,
+        scalar_hidden=(32,),
+    ):
+        super().__init__()
+        self.n1, self.n_scalar, self.n_outputs = n1, n_scalar, n_outputs
+
+        # conv front-end: (b, n_conv_vars, n1) -> (b, d_model, n1), giving each
+        # level local context before attention
+        layers, in_ch = [], n_conv_vars
+        for out_ch in conv_channels:
+            layers += [nn.Conv1d(in_ch, out_ch, kernel_size,
+                                 padding=kernel_size // 2), nn.ReLU()]
+            in_ch = out_ch
+        layers.append(nn.Conv1d(in_ch, d_model, 1))    # project to d_model
+        self.tokenizer = nn.Sequential(*layers)
+
+        # learned positional embedding — one per level, so the model knows height order
+        self.pos_embed = nn.Parameter(torch.randn(1, n1, d_model) * 0.02)
+
+        # scalar context token
+        if n_scalar > 0:
+            slayers, prev = [], n_scalar
+            for h in scalar_hidden:
+                slayers += [nn.Linear(prev, h), nn.ReLU()]
+                prev = h
+            slayers.append(nn.Linear(prev, d_model))
+            self.scalar_net = nn.Sequential(*slayers)
+        else:
+            self.scalar_net = None
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=dim_feedforward,
+            dropout=dropout, batch_first=True, activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=num_layers)
+
+        self.out_proj = nn.Linear(d_model, 1)          # per-level scalar output
+        # fallback if outputs aren't one-per-level
+        self.final = nn.Linear(n1, n_outputs) if n_outputs != n1 else None
+
+    def forward(self, x_conv, x_scalar=None):
+        b = x_conv.shape[0]
+        tokens = self.tokenizer(x_conv).transpose(1, 2)   # (b, n1, d_model)
+        tokens = tokens + self.pos_embed
+
+        if self.scalar_net is not None:
+            ctx = self.scalar_net(x_scalar).unsqueeze(1)  # (b, 1, d_model)
+            tokens = torch.cat([ctx, tokens], dim=1)      # prepend context token
+
+        encoded = self.encoder(tokens)
+
+        # drop the context token before producing per-level outputs
+        if self.scalar_net is not None:
+            encoded = encoded[:, 1:, :]
+
+        out = self.out_proj(encoded).squeeze(-1)          # (b, n1)
+        return self.final(out) if self.final is not None else out
+
+
+
+
+
+def train_transformer(
+    Xc_train, Xs_train, y_train,
+    Xc_val=None, Xs_val=None, y_val=None,
+    model_args=None,
+    epochs=100, lr=1e-3, weight_decay=0.0, batch_size=256,
+    patience=None, min_delta=0.0, num_workers=0,
+    save_path=None, verbose=True,
+):
+
+    model_args = model_args or {}
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    has_val = Xc_val is not None
+    has_scalar = Xs_train is not None and Xs_train.shape[1] > 0
+    if patience is not None and not has_val:
+        raise ValueError("early stopping needs a validation set.")
+
+    # --- scaling: fit on train only ---
+    Xc_mean, Xc_std = Xc_train.mean(0), Xc_train.std(0)
+    Xc_std = np.where(Xc_std == 0, 1.0, Xc_std)
+    y_mean, y_std = y_train.mean(0), y_train.std(0)
+    y_std = np.where(y_std == 0, 1.0, y_std)
+    scaler = {"Xc_mean": Xc_mean, "Xc_std": Xc_std, "y_mean": y_mean, "y_std": y_std}
+    if has_scalar:
+        Xs_mean, Xs_std = Xs_train.mean(0), Xs_train.std(0)
+        Xs_std = np.where(Xs_std == 0, 1.0, Xs_std)
+        scaler.update({"Xs_mean": Xs_mean, "Xs_std": Xs_std})
+
+    def prep(Xc, Xs, y):
+        tc = torch.tensor((Xc - Xc_mean) / Xc_std, dtype=torch.float32)
+        ty = torch.tensor((y - y_mean) / y_std, dtype=torch.float32)
+        if has_scalar:
+            ts = torch.tensor((Xs - Xs_mean) / Xs_std, dtype=torch.float32)
+            return tc, ts, ty
+        return tc, torch.zeros(len(Xc), 0), ty
+
+    tc, ts, ty = prep(Xc_train, Xs_train, y_train)
+    loader = DataLoader(TensorDataset(tc, ts, ty), batch_size=batch_size,
+                        shuffle=True, num_workers=num_workers)
+    if has_val:
+        vc, vs, vy = prep(Xc_val, Xs_val, y_val)
+        vc, vs, vy = vc.to(device), vs.to(device), vy.to(device)
+
+   
+    
+    # ... identical setup, scaling, and prep() as train_conv_scalar ...
+
+    model = ProfileTransformer(
+        n_conv_vars=tc.shape[1], n1=tc.shape[2],
+        n_scalar=(ts.shape[1] if has_scalar else 0),
+        n_outputs=ty.shape[1], **(model_args or {}),
+    ).to(device)
+
+    opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    loss_fn = nn.MSELoss()
+
+    history = {"train": [], "val": []}
+    best_val, best_state, best_epoch, since = np.inf, None, -1, 0
+
+    for epoch in range(epochs):
+        model.train()
+        running = 0.0
+        for xc, xs, yb in loader:
+            xc, xs, yb = xc.to(device), xs.to(device), yb.to(device)
+            opt.zero_grad()
+            loss = loss_fn(model(xc, xs if has_scalar else None), yb)
+            loss.backward()
+            opt.step()
+            running += loss.item() * len(xc)
+        train_loss = running / len(tc)
+        history["train"].append(train_loss)
+
+        val_loss = None
+        if has_val:
+            val_loss = _eval_loss(model, vc, vs, vy, loss_fn, has_scalar,
+                                  batch_size=batch_size)
+            history["val"].append(val_loss)
+
+        if verbose:
+            msg = f"epoch {epoch:3d} | train {train_loss:.4e}"
+            if val_loss is not None:
+                msg += f" | val {val_loss:.4e}"
+            print(msg)
+
+        if patience is not None and since >= patience:
+            if verbose:
+                print(f"early stop at epoch {epoch}; best epoch {best_epoch} "
+                      f"(val {best_val:.4e})")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    if save_path is not None:
+        torch.save({"model_state": model.state_dict(), "model_args": model_args,
+                    "n_conv_vars": tc.shape[1], "n1": tc.shape[2],
+                    "n_scalar": (ts.shape[1] if has_scalar else 0),
+                    "n_outputs": ty.shape[1], "scaler": scaler}, save_path)
+        if verbose:
+            print(f"saved to {save_path}")
+
+    return model, scaler, history

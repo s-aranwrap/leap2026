@@ -16,7 +16,7 @@ Data generated for the DYnamics of the Atmospheric general circulation Modeled O
 
 We use data from the km-scale CESM run for DYnamics of the Atmospheric general circulation Modeled On Non-hydrostatic Domains (DYAMOND) global storm-resolving model comparison project. The atmospheric model used in this simulation is the Community Atmosphere Model (CAM7), which runs at a resolution of 3.75 km on 58 atmospheric levels with modified CAM physics (no ZM convection scheme, modified CLUBB). This includes 2(3??) runs: DYAMOND1 is a 40-day run starting on 1 August 2016, DYAMOND2 is a 40-day run starting on 20 January 2020, and DYAMOND3 (not used here) is a 1-year run starting on 1 March 2020. These are initialized with ERA5 and coupled to high-resolution (3.75 km) land, ocean, and sea ice.
 
-Tendencies are calculated for each 3-hour interval. 
+Temperature and moisture tendencies due to moist processes (PTTEND and PCQ) are calculated for each 3-hour interval. 
 
 ### Coarse Graining
 
@@ -25,18 +25,22 @@ Atmospheric state variables and tendencies coarse-grained from a resolution of 3
 
 ### Data
 
-???
+We withhold the last 4 days (10%) of each of the two DYAMOND runs for testing. 
 
-Mechanically, mirroring YOG20: at each timestep you use, keep all 180 latitudes, and for each latitude randomly draw a subset of the 360 longitudes, say on the order of 20–25, with the random draw refreshed each timestep so you're not always sampling the same meridians.
+Using the same approach as Yuval & O'Gorman, 2020, we reduce redundancy in the training set: at each timestep, we keep all 180 latitudes, and for each latitude randomly draw a subset of 20 of the 360 longitudes.
 
 
 ### Machine Learning Architecture
 
-???
+#### Random Forest 
+
+#### 
 
 ## Results
 
-???
+With a random forest, we were able to achieve a ...
+
+
 
 ## References
 
