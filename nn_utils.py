@@ -6,6 +6,10 @@ from torch.utils.data import TensorDataset, DataLoader
 import copy
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
+import math
+from torch.optim.lr_scheduler import LambdaLR
+
+
 
 
 
@@ -57,6 +61,21 @@ class MLP(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+
+
+
+def make_warmup_cosine(optimizer, warmup_steps, total_steps, min_lr_ratio=0.05):
+    """LR ramps linearly to full over warmup_steps, then cosine-decays toward
+    min_lr_ratio * base_lr by total_steps. Step this once per batch."""
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / max(1, warmup_steps)               # linear ramp up
+        # cosine decay from 1.0 down to min_lr_ratio
+        progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        progress = min(progress, 1.0)
+        cosine = 0.5 * (1 + math.cos(math.pi * progress))
+        return min_lr_ratio + (1 - min_lr_ratio) * cosine
+    return LambdaLR(optimizer, lr_lambda)
 
 
 
@@ -558,12 +577,17 @@ class ConvScalarNet(nn.Module):
 
 
 
+
+
 def train_conv_scalar(
     Xc_train, Xs_train, y_train,
     Xc_val=None, Xs_val=None, y_val=None,
     model_args=None,
     epochs=100, lr=1e-3, weight_decay=0.0, batch_size=512,
     patience=None, min_delta=0.0, num_workers=0,
+    use_scheduler=False,            # <-- toggle warmup + cosine decay
+    warmup_frac=0.05,               # <-- fraction of total steps spent warming up
+    min_lr_ratio=0.05,              # <-- floor of the decay, as a fraction of lr
     save_path=None, verbose=True,
 ):
     model_args = model_args or {}
@@ -574,7 +598,6 @@ def train_conv_scalar(
         raise ValueError("early stopping needs a validation set.")
 
     # --- scaling (fit on train only) ---
-    # conv: per (variable, level) so each profile point is normalized on its own scale
     Xc_mean, Xc_std = Xc_train.mean(0), Xc_train.std(0)
     Xc_std = np.where(Xc_std == 0, 1.0, Xc_std)
     y_mean, y_std = y_train.mean(0), y_train.std(0)
@@ -591,14 +614,13 @@ def train_conv_scalar(
         if has_scalar:
             ts = torch.tensor((Xs - Xs_mean) / Xs_std, dtype=torch.float32)
             return tc, ts, ty
-        return tc, torch.zeros(len(Xc), 0), ty     # placeholder keeps the loader uniform
+        return tc, torch.zeros(len(Xc), 0), ty
 
     tc, ts, ty = prep(Xc_train, Xs_train, y_train)
     loader = DataLoader(TensorDataset(tc, ts, ty), batch_size=batch_size,
                         shuffle=True, num_workers=num_workers)
     if has_val:
-        vc, vs, vy = prep(Xc_val, Xs_val, y_val)
-        vc, vs, vy = vc.to(device), vs.to(device), vy.to(device)
+        vc, vs, vy = prep(Xc_val, Xs_val, y_val)      # kept on CPU; moved per-batch
 
     model = ConvScalarNet(
         n_conv_vars=tc.shape[1], n1=tc.shape[2],
@@ -607,6 +629,26 @@ def train_conv_scalar(
     ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.MSELoss()
+
+    # --- scheduler (optional) ---
+    scheduler = None
+    if use_scheduler:
+        total_steps = len(loader) * epochs
+        warmup_steps = int(warmup_frac * total_steps)
+        scheduler = make_warmup_cosine(opt, warmup_steps, total_steps, min_lr_ratio)
+
+    # batched validation loss, so a large val set can't blow up a single kernel launch
+    def eval_loss():
+        model.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for i in range(0, len(vc), batch_size):
+                xb = vc[i:i+batch_size].to(device)
+                sb = vs[i:i+batch_size].to(device) if has_scalar else None
+                yb = vy[i:i+batch_size].to(device)
+                total += loss_fn(model(xb, sb), yb).item() * len(xb)
+                n += len(xb)
+        return total / n
 
     history = {"train": [], "val": []}
     best_val, best_state, best_epoch, since = np.inf, None, -1, 0
@@ -617,19 +659,18 @@ def train_conv_scalar(
         for xc, xs, yb in loader:
             xc, xs, yb = xc.to(device), xs.to(device), yb.to(device)
             opt.zero_grad()
-            pred = model(xc, xs if has_scalar else None)
-            loss = loss_fn(pred, yb)
+            loss = loss_fn(model(xc, xs if has_scalar else None), yb)
             loss.backward()
             opt.step()
+            if scheduler is not None:
+                scheduler.step()                       # per-batch LR update
             running += loss.item() * len(xc)
         train_loss = running / len(tc)
         history["train"].append(train_loss)
 
         val_loss = None
         if has_val:
-            model.eval()
-            with torch.no_grad():
-                val_loss = loss_fn(model(vc, vs if has_scalar else None), vy).item()
+            val_loss = eval_loss()
             history["val"].append(val_loss)
             if val_loss < best_val - min_delta:
                 best_val, best_epoch, since = val_loss, epoch, 0
@@ -638,9 +679,12 @@ def train_conv_scalar(
                 since += 1
 
         if verbose:
+            lr_now = opt.param_groups[0]["lr"]
             msg = f"epoch {epoch:3d} | train {train_loss:.4f}"
             if val_loss is not None:
                 msg += f" | val {val_loss:.4f}"
+            if scheduler is not None:
+                msg += f" | lr {lr_now:.2e}"
             print(msg)
 
         if patience is not None and since >= patience:
@@ -661,7 +705,6 @@ def train_conv_scalar(
             print(f"saved to {save_path}")
 
     return model, scaler, history
-
 
 
 
@@ -1044,6 +1087,9 @@ def train_transformer(
     model_args=None,
     epochs=100, lr=1e-3, weight_decay=0.0, batch_size=256,
     patience=None, min_delta=0.0, num_workers=0,
+    use_scheduler=False,            # <-- toggle warmup + cosine decay
+    warmup_frac=0.05,               # <-- fraction of total steps spent warming up
+    min_lr_ratio=0.05,
     save_path=None, verbose=True,
 ):
 
@@ -1093,6 +1139,26 @@ def train_transformer(
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
     loss_fn = nn.MSELoss()
 
+    # --- scheduler (optional) ---
+    scheduler = None
+    if use_scheduler:
+        total_steps = len(loader) * epochs
+        warmup_steps = int(warmup_frac * total_steps)
+        scheduler = make_warmup_cosine(opt, warmup_steps, total_steps, min_lr_ratio)
+
+    # batched validation loss, so a large val set can't blow up a single kernel launch
+    def eval_loss():
+        model.eval()
+        total, n = 0.0, 0
+        with torch.no_grad():
+            for i in range(0, len(vc), batch_size):
+                xb = vc[i:i+batch_size].to(device)
+                sb = vs[i:i+batch_size].to(device) if has_scalar else None
+                yb = vy[i:i+batch_size].to(device)
+                total += loss_fn(model(xb, sb), yb).item() * len(xb)
+                n += len(xb)
+        return total / n
+
     history = {"train": [], "val": []}
     best_val, best_state, best_epoch, since = np.inf, None, -1, 0
 
@@ -1105,26 +1171,35 @@ def train_transformer(
             loss = loss_fn(model(xc, xs if has_scalar else None), yb)
             loss.backward()
             opt.step()
+            if scheduler is not None:
+                scheduler.step()                       # per-batch LR update
             running += loss.item() * len(xc)
         train_loss = running / len(tc)
         history["train"].append(train_loss)
 
         val_loss = None
         if has_val:
-            val_loss = _eval_loss(model, vc, vs, vy, loss_fn, has_scalar,
-                                  batch_size=batch_size)
+            val_loss = eval_loss()
             history["val"].append(val_loss)
+            if val_loss < best_val - min_delta:
+                best_val, best_epoch, since = val_loss, epoch, 0
+                best_state = copy.deepcopy(model.state_dict())
+            else:
+                since += 1
 
         if verbose:
-            msg = f"epoch {epoch:3d} | train {train_loss:.4e}"
+            lr_now = opt.param_groups[0]["lr"]
+            msg = f"epoch {epoch:3d} | train {train_loss:.4f}"
             if val_loss is not None:
-                msg += f" | val {val_loss:.4e}"
+                msg += f" | val {val_loss:.4f}"
+            if scheduler is not None:
+                msg += f" | lr {lr_now:.2e}"
             print(msg)
 
         if patience is not None and since >= patience:
             if verbose:
                 print(f"early stop at epoch {epoch}; best epoch {best_epoch} "
-                      f"(val {best_val:.4e})")
+                      f"(val {best_val:.4f})")
             break
 
     if best_state is not None:
@@ -1139,3 +1214,10 @@ def train_transformer(
             print(f"saved to {save_path}")
 
     return model, scaler, history
+
+
+
+
+
+
+
